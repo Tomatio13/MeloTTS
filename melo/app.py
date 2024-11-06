@@ -1,13 +1,14 @@
-# WebUI by mrfakename <X @realmrfakename / HF @mrfakename>
-# Demo also available on HF Spaces: https://huggingface.co/spaces/mrfakename/MeloTTS
-import gradio as gr
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 import os, torch, io
-# os.system('python -m unidic download')
-print("Make sure you've downloaded unidic (python -m unidic download) for this WebUI to work.")
 from melo.api import TTS
-speed = 1.0
+from typing import Optional
 import tempfile
-import click
+import uuid
+
+app = FastAPI(title="MeloTTS API")
+
 device = 'auto'
 models = {
     'EN': TTS(language='EN', device=device),
@@ -17,7 +18,6 @@ models = {
     'JP': TTS(language='JP', device=device),
     'KR': TTS(language='KR', device=device),
 }
-speaker_ids = models['EN'].hps.data.spk2id
 
 default_text_dict = {
     'EN': 'The field of text-to-speech has seen rapid development recently.',
@@ -27,35 +27,72 @@ default_text_dict = {
     'JP': 'テキスト読み上げの分野は最近急速な発展を遂げています',
     'KR': '최근 텍스트 음성 변환 분야가 급속도로 발전하고 있습니다.',    
 }
-    
-def synthesize(speaker, text, speed, language, progress=gr.Progress()):
-    bio = io.BytesIO()
-    models[language].tts_to_file(text, models[language].hps.data.spk2id[speaker], bio, speed=speed, pbar=progress.tqdm, format='wav')
-    return bio.getvalue()
-def load_speakers(language, text):
-    if text in list(default_text_dict.values()):
-        newtext = default_text_dict[language]
-    else:
-        newtext = text
-    return gr.update(value=list(models[language].hps.data.spk2id.keys())[0], choices=list(models[language].hps.data.spk2id.keys())), newtext
-with gr.Blocks() as demo:
-    gr.Markdown('# MeloTTS WebUI\n\nA WebUI for MeloTTS.')
-    with gr.Group():
-        speaker = gr.Dropdown(speaker_ids.keys(), interactive=True, value='EN-US', label='Speaker')
-        language = gr.Radio(['EN', 'ES', 'FR', 'ZH', 'JP', 'KR'], label='Language', value='EN')
-        speed = gr.Slider(label='Speed', minimum=0.1, maximum=10.0, value=1.0, interactive=True, step=0.1)
-        text = gr.Textbox(label="Text to speak", value=default_text_dict['EN'])
-        language.input(load_speakers, inputs=[language, text], outputs=[speaker, text])
-    btn = gr.Button('Synthesize', variant='primary')
-    aud = gr.Audio(interactive=False)
-    btn.click(synthesize, inputs=[speaker, text, speed, language], outputs=[aud])
-    gr.Markdown('WebUI by [mrfakename](https://twitter.com/realmrfakename).')
-@click.command()
-@click.option('--share', '-s', is_flag=True, show_default=True, default=False, help="Expose a publicly-accessible shared Gradio link usable by anyone with the link. Only share the link with people you trust.")
-@click.option('--host', '-h', default=None)
-@click.option('--port', '-p', type=int, default=None)
-def main(share, host, port):
-    demo.queue(api_open=False).launch(show_api=True, share=share, server_name=host, server_port=port)
+
+class TTSRequest(BaseModel):
+    speaker: str
+    text: str
+    speed: float = 1.0
+    language: str
+
+class SpeakersRequest(BaseModel):
+    language: str
+    text: str
+
+@app.post("/synthesize")
+async def synthesize(request: TTSRequest):
+    try:
+        if request.language not in models:
+            raise HTTPException(status_code=400, detail="Invalid language")
+        
+        # UUIDを生成してファイル名に使用
+        unique_filename = f"speech_{str(uuid.uuid4())}.wav"
+        
+        bio = io.BytesIO()
+        models[request.language].tts_to_file(
+            request.text, 
+            models[request.language].hps.data.spk2id[request.speaker], 
+            bio, 
+            speed=request.speed,
+            format='wav'
+        )
+        bio.seek(0)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            temp_file.write(bio.getvalue())
+            temp_file_path = temp_file.name
+
+        async def cleanup_file():
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                print(f"Error cleaning up file: {e}")
+        
+        return FileResponse(
+            temp_file_path,
+            media_type="audio/wav",
+            filename=unique_filename,  # UUIDベースのファイル名を使用
+            background=cleanup_file
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/load_speakers")
+async def load_speakers(request: SpeakersRequest):
+    try:
+        if request.language not in models:
+            raise HTTPException(status_code=400, detail="Invalid language")
+        
+        available_speakers = list(models[request.language].hps.data.spk2id.keys())
+        new_text = default_text_dict[request.language] if request.text in default_text_dict.values() else request.text
+        
+        return {
+            "speaker": available_speakers[0],
+            "available_speakers": available_speakers,
+            "text": new_text
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
